@@ -1,0 +1,1251 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\ShaSubBenefit;
+use App\Models\ShaIntervention;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
+use Exception;
+use Illuminate\Support\Facades\DB;
+
+class DhaIntegrationService
+{
+    protected string $baseUrl;
+    protected string $clientId;
+    protected string $clientSecret;
+
+    public function __construct()
+    {
+        $this->baseUrl      = config('services.dha.base_url', env('DHA_BASE_URL'));
+        $this->clientId     = config('services.dha.client_id', env('DHA_CLIENT_ID'));
+        $this->clientSecret = config('services.dha.client_secret', env('DHA_CLIENT_SECRET'));
+    }
+
+    protected function logGatewayCall(
+        string $label,
+        string $method,
+        string $url,
+        $response,
+        array $requestMeta = []
+    ): void {
+        $body = $response->json();
+
+        if ($label === 'getAccessToken' && is_array($body)) {
+            if (isset($body['access_token'])) {
+                $body['access_token'] = '[REDACTED]';
+            }
+        }
+
+        Log::info("DHA {$label}", array_merge([
+            'method' => $method,
+            'url'    => $url,
+            'status' => $response->status(),
+            'body'   => $body ?? $response->body(),
+        ], $requestMeta));
+    }
+
+    protected function getAccessToken(): string
+    {
+        return Cache::remember('dha_middleware_token', 55, function () {
+
+            if (empty($this->clientId) || empty($this->clientSecret)) {
+                throw new Exception(
+                    'Missing DHA_CLIENT_ID / DHA_CLIENT_SECRET in .env.'
+                );
+            }
+
+            $url = rtrim($this->baseUrl, '/') .
+                '/api/v1/tenants/token';
+
+            $response = Http::asForm()
+                ->timeout(15)
+                ->post($url, [
+                    'client_id'     => $this->clientId,
+                    'client_secret' => $this->clientSecret,
+                ]);
+
+            $this->logGatewayCall(
+                'getAccessToken',
+                'POST',
+                $url,
+                $response
+            );
+
+            if ($response->failed()) {
+                $error = $response->json('message')
+                    ?? $response->json('error')
+                    ?? $response->body();
+
+                throw new Exception(
+                    "DHA auth failed ({$response->status()}): {$error}"
+                );
+            }
+
+            $token = $response->json('access_token');
+
+            if (blank($token)) {
+                throw new Exception(
+                    'DHA returned no access_token: ' . $response->body()
+                );
+            }
+
+            return $token;
+        });
+    }
+
+    public function searchPatient(
+        string $identificationNumber,
+        string $identificationType = 'National ID'
+    ): array {
+        $token = $this->getAccessToken();
+
+        $url = rtrim($this->baseUrl, '/') .
+            '/api/v1/patients';
+
+        $query = [
+            'identification_number' => $identificationNumber,
+            'identification_type'   => $identificationType,
+        ];
+
+        $response = Http::withToken($token)
+            ->timeout(15)
+            ->get($url, $query);
+
+        $this->logGatewayCall(
+            'searchPatient',
+            'GET',
+            $url,
+            $response,
+            ['query' => $query]
+        );
+
+        if ($response->status() === 400) {
+            $msg = $response->json('message') ?? '';
+
+            if (str_contains($msg, 'zero results found')) {
+                return [
+                    'found' => false,
+                    'raw'   => $response->json(),
+                ];
+            }
+        }
+
+        if ($response->failed()) {
+            throw new Exception(
+                "Patient search failed ({$response->status()}): {$response->body()}"
+            );
+        }
+
+        $data = $response->json();
+
+        $otherIds = collect($data['other_identifications'] ?? []);
+
+        $shaNumber = $otherIds->firstWhere(
+            'identification_type',
+            'SHA Number'
+        )['identification_number'] ?? null;
+
+        $householdNumber = $otherIds->firstWhere(
+            'identification_type',
+            'Household Number'
+        )['identification_number'] ?? null;
+
+        return [
+            'found'            => true,
+            'patient_id'       => $data['id'] ?? null,
+            'full_name'        => trim(
+                ($data['first_name'] ?? '') . ' ' .
+                ($data['middle_name'] ?? '') . ' ' .
+                ($data['last_name'] ?? '')
+            ),
+            'first_name'       => $data['first_name'] ?? null,
+            'last_name'        => $data['last_name'] ?? null,
+            'gender'           => $data['gender'] ?? null,
+            'date_of_birth'    => $data['date_of_birth'] ?? null,
+            'phone'            => $data['phone'] ?? null,
+            'county'           => $data['county'] ?? null,
+            'sub_county'       => $data['sub_county'] ?? null,
+            'sha_number'       => $shaNumber,
+            'household_number' => $householdNumber,
+            'employment_type'  => $data['employment_type'] ?? null,
+            'raw'              => $data,
+        ];
+    }
+
+    public function checkEligibility(
+        string $identificationNumber,
+        string $identificationType = 'National ID'
+    ): array {
+        $token = $this->getAccessToken();
+
+        $url = rtrim($this->baseUrl, '/') .
+            '/api/v1/patients/eligibility';
+
+        $query = [
+            'identification_number' => $identificationNumber,
+            'identification_type'   => $identificationType,
+        ];
+
+        $response = Http::withToken($token)
+            ->timeout(15)
+            ->get($url, $query);
+
+        $this->logGatewayCall(
+            'checkEligibility',
+            'GET',
+            $url,
+            $response,
+            ['query' => $query]
+        );
+
+        if ($response->failed()) {
+            throw new Exception(
+                "Eligibility check failed ({$response->status()}): {$response->body()}"
+            );
+        }
+
+        $data = $response->json();
+
+        $schemes = collect($data['schemes'] ?? [])
+            ->map(function ($s) {
+                return [
+                    'scheme_name'      => $s['schemeName'] ?? null,
+                    'member_type'      => $s['memberType'] ?? null,
+                    'policy_start'     => $s['policy']['startDate'] ?? null,
+                    'policy_end'       => $s['policy']['endDate'] ?? null,
+                    'policy_number'    => $s['policy']['number'] ?? null,
+                    'covered'          => ($s['coverage']['status'] ?? null) === '1',
+                    'coverage_message' => $s['coverage']['message'] ?? null,
+                    'coverage_reason'  => $s['coverage']['reason'] ?? null,
+                    'coverage_start'   => $s['coverage']['startDate'] ?? null,
+                    'coverage_end'     => $s['coverage']['endDate'] ?? null,
+                ];
+            })
+            ->values();
+
+        return [
+            'found'            => ($data['statusCode'] ?? null) === '10',
+            'status_code'      => $data['statusCode'] ?? null,
+            'status_desc'      => $data['statusDesc'] ?? null,
+            'full_name'        => $data['fullName'] ?? null,
+            'member_cr_number' => $data['memberCrNumber'] ?? null,
+            'is_alive'         => $data['isAlive'] ?? null,
+            'eligible'         => $schemes->contains('covered', true),
+            'schemes'          => $schemes,
+            'raw'              => $data,
+        ];
+    }
+
+    public function patientLookup(
+        string $identificationNumber,
+        string $identificationType = 'National ID'
+    ): array {
+        $patient = $this->searchPatient(
+            $identificationNumber,
+            $identificationType
+        );
+
+        if (!$patient['found']) {
+            return [
+                'sha_status'  => 'not_registered',
+                'patient'     => null,
+                'eligibility' => null,
+            ];
+        }
+
+        $eligibility = $this->checkEligibility(
+            $identificationNumber,
+            $identificationType
+        );
+
+        return [
+            'sha_status'  => $eligibility['eligible']
+                ? 'eligible'
+                : 'not_eligible',
+            'patient'     => $patient,
+            'eligibility' => $eligibility,
+        ];
+    }
+
+    public function getPatientContacts(string $patientId): array
+    {
+        $token = $this->getAccessToken();
+
+        $url = rtrim($this->baseUrl, '/') .
+            '/api/v1/patients/contacts';
+
+        $query = [
+            'patient_id' => $patientId,
+        ];
+
+        $response = Http::withToken($token)
+            ->timeout(15)
+            ->get($url, $query);
+
+        $this->logGatewayCall(
+            'getPatientContacts',
+            'GET',
+            $url,
+            $response,
+            ['patient_id' => $patientId]
+        );
+
+        if ($response->failed()) {
+            throw new Exception(
+                "Get patient contacts failed ({$response->status()}): {$response->body()}"
+            );
+        }
+
+        $data = $response->json();
+
+        $contacts = collect($data['results'] ?? [])
+            ->map(fn ($c) => [
+                'id'           => $c['id'] ?? null,
+                'masked_value' => $c['contactValue'] ?? null,
+                'type'         => $c['contactType'] ?? null,
+                'is_confirmed' => $c['isConfirmed'] ?? null,
+                'active'       => $c['active'] ?? null,
+            ])
+            ->values();
+
+        return [
+            'count'    => $data['count'] ?? $contacts->count(),
+            'contacts' => $contacts,
+            'raw'      => $data,
+        ];
+    }
+
+    public function sendOtp(
+        string $patientId,
+        array $interventionCodes,
+        ?int $beneficiaryContactId = null
+    ): array {
+        $token = $this->getAccessToken();
+
+        $url = rtrim($this->baseUrl, '/') .
+            '/api/v1/claims/otp';
+
+        $payload = array_filter([
+            'patient_id'             => $patientId,
+            'intervention_codes'     => $interventionCodes,
+            'beneficiary_contact_id' => $beneficiaryContactId,
+        ], fn ($v) => $v !== null);
+
+        $response = Http::withToken($token)
+            ->timeout(15)
+            ->post($url, $payload);
+
+        $this->logGatewayCall(
+            'sendOtp',
+            'POST',
+            $url,
+            $response,
+            ['payload' => $payload]
+        );
+
+        if ($response->failed()) {
+            throw new Exception(
+                "Send OTP failed ({$response->status()}): {$response->body()}"
+            );
+        }
+
+        return [
+            'success' => true,
+            'raw'     => $response->json(),
+        ];
+    }
+
+    public function createClaimVisit(array $params): array
+    {
+        foreach ([
+            'patient_id',
+            'intervention_codes',
+            'service_type',
+        ] as $required) {
+            if (empty($params[$required])) {
+                throw new Exception(
+                    "createClaimVisit: missing required param '{$required}'."
+                );
+            }
+        }
+
+        if (empty($params['otp']) && empty($params['auth_guid'])) {
+            throw new Exception(
+                "createClaimVisit: either 'otp' or 'auth_guid' is required."
+            );
+        }
+
+        $token = $this->getAccessToken();
+
+        $url = rtrim($this->baseUrl, '/') .
+            '/api/v1/claims/visit';
+
+        $payload = array_filter([
+            'patient_id'         => $params['patient_id'],
+            'intervention_codes' => $params['intervention_codes'],
+            'service_type'       => $params['service_type'],
+            'otp'                => $params['otp'] ?? null,
+            'auth_guid'          => $params['auth_guid'] ?? null,
+        ], fn ($v) => $v !== null);
+
+        $response = Http::withToken($token)
+            ->timeout(20)
+            ->post($url, $payload);
+
+        $this->logGatewayCall(
+            'createClaimVisit',
+            'POST',
+            $url,
+            $response,
+            [
+                'payload_keys' => array_keys($payload),
+            ]
+        );
+
+        if ($response->failed()) {
+            throw new Exception(
+                "Create claim visit failed ({$response->status()}): {$response->body()}"
+            );
+        }
+
+        $data = $response->json();
+
+        $consentToken = $data['authorization_code']
+            ?? $data['consent_token']
+            ?? $data['token']
+            ?? null;
+
+        if (!$consentToken) {
+            Log::warning(
+                'createClaimVisit: succeeded but no token found.',
+                ['raw' => $data]
+            );
+        }
+
+        return [
+            'consent_token'  => $consentToken,
+            'claim_id'       => $data['id'] ?? null,
+            'workflow_state' => $data['workflow_state'] ?? null,
+            'visit_number'   => $data['visit_number'] ?? null,
+            'raw'            => $data,
+        ];
+    }
+
+    public function addClaimIntervention(
+        string $consentToken,
+        string $interventionCode
+    ): array {
+        $token = $this->getAccessToken();
+
+        $url = rtrim($this->baseUrl, '/') .
+            '/api/v1/claims/interventions';
+
+        $payload = [
+            'consent_token'     => $consentToken,
+            'intervention_code' => $interventionCode,
+        ];
+
+        $response = Http::withToken($token)
+            ->timeout(15)
+            ->post($url, $payload);
+
+        $this->logGatewayCall(
+            'addClaimIntervention',
+            'POST',
+            $url,
+            $response,
+            [
+                'intervention_code' => $interventionCode,
+            ]
+        );
+
+        if ($response->failed()) {
+            throw new Exception(
+                "Add claim intervention failed ({$response->status()}): {$response->body()}"
+            );
+        }
+
+        return [
+            'success' => true,
+            'raw'     => $response->json(),
+        ];
+    }
+
+    public function addClaimLine(array $params): array
+    {
+        foreach ([
+            'consent_token',
+            'intervention_code',
+            'unit_price',
+            'quantity',
+            'service_name',
+            'service_identifier',
+            'practitioner_identification_number',
+            'practitioner_regulation_body',
+        ] as $required) {
+            if (!isset($params[$required]) || $params[$required] === '') {
+                throw new Exception(
+                    "addClaimLine: missing required param '{$required}'."
+                );
+            }
+        }
+
+        $token = $this->getAccessToken();
+
+        $url = rtrim($this->baseUrl, '/') .
+            '/api/v1/claims/lines';
+
+        $payload = [
+            'consent_token'                       => $params['consent_token'],
+            'intervention_code'                  => $params['intervention_code'],
+            'unit_price'                          => (string) $params['unit_price'],
+            'quantity'                            => (string) $params['quantity'],
+            'service_name'                        => $params['service_name'],
+            'service_identifier'                  => $params['service_identifier'],
+            'practitioner_identification_type'   =>
+                $params['practitioner_identification_type']
+                ?? 'registration_number',
+            'practitioner_identification_number' =>
+                $params['practitioner_identification_number'],
+            'practitioner_regulation_body'       =>
+                $params['practitioner_regulation_body'],
+        ];
+
+        $response = Http::withToken($token)
+            ->asForm()
+            ->timeout(15)
+            ->post($url, $payload);
+
+        $this->logGatewayCall(
+            'addClaimLine',
+            'POST',
+            $url,
+            $response,
+            [
+                'intervention_code'  => $params['intervention_code'],
+                'service_identifier' => $params['service_identifier'],
+            ]
+        );
+
+        if ($response->failed()) {
+            throw new Exception(
+                "Add claim line failed ({$response->status()}): {$response->body()}"
+            );
+        }
+
+        return [
+            'success' => true,
+            'raw'     => $response->json(),
+        ];
+    }
+
+    public function getSubBenefits(string $patientId): array
+    {
+        $token = $this->getAccessToken();
+
+        $url = rtrim($this->baseUrl, '/') .
+            '/api/v1/patients/sub-benefits';
+
+        $query = [
+            'patient_id' => $patientId,
+        ];
+
+        $response = Http::withToken($token)
+            ->timeout(15)
+            ->get($url, $query);
+
+        $this->logGatewayCall(
+            'getSubBenefits',
+            'GET',
+            $url,
+            $response,
+            ['query' => $query]
+        );
+
+        if ($response->failed()) {
+            throw new Exception(
+                "Sub-benefit lookup failed ({$response->status()}): {$response->body()}"
+            );
+        }
+
+        $data = $response->json();
+
+        $subBenefits = collect($data['results'] ?? [])
+            ->map(fn ($r) => [
+                'code'                => $r['code'] ?? null,
+                'name'                => $r['name'] ?? null,
+                'access_point'        => $r['accessPoint'] ?? null,
+                'fund'                => $r['fund'] ?? null,
+                'parent_benefit'      => $r['parentBenefit'] ?? null,
+                'parent_benefit_code' => $r['parentBenefitCode'] ?? null,
+            ])
+            ->values();
+
+        return [
+            'count'        => $data['count'] ?? $subBenefits->count(),
+            'sub_benefits' => $subBenefits,
+            'raw'          => $data,
+        ];
+    }
+
+    public function getInterventions(
+        string $patientId,
+        string $subBenefitCode
+    ): array {
+        $token = $this->getAccessToken();
+
+        $url = rtrim($this->baseUrl, '/') .
+            '/api/v1/patients/benefits/interventions';
+
+        $query = [
+            'patient_id'       => $patientId,
+            'sub_benefit_code' => $subBenefitCode,
+        ];
+
+        $response = Http::withToken($token)
+            ->timeout(15)
+            ->get($url, $query);
+
+        $this->logGatewayCall(
+            'getInterventions',
+            'GET',
+            $url,
+            $response,
+            ['query' => $query]
+        );
+
+        if ($response->failed()) {
+            throw new Exception(
+                "Intervention lookup failed ({$response->status()}): {$response->body()}"
+            );
+        }
+
+        $data = $response->json();
+
+        $interventions = collect($data['results'] ?? [])
+            ->map(fn ($r) => [
+                'code'                          => $r['code'] ?? null,
+                'name'                          => $r['name'] ?? null,
+                'access_point'                  => $r['accessPoint'] ?? null,
+                'payment_mechanism'             => $r['paymentMechanism'] ?? null,
+                'overall_tariff'                => isset($r['overallTariff'])
+                    ? (float) $r['overallTariff']
+                    : null,
+                'fund'                          => $r['fund'] ?? null,
+                'needs_preauth'                 => $r['needsPreauth'] ?? false,
+                'needs_manual_preauth_approval' =>
+                    $r['needsManualPreauthApproval'] ?? false,
+                'needs_doctor_authorization'    =>
+                    $r['needsDoctorAuthorization'] ?? false,
+                'requires_surgical_preauth'     =>
+                    $r['requiresSurgicalPreauth'] ?? false,
+                'requires_renal_preauth'        =>
+                    $r['requiresRenalPreauth'] ?? false,
+                'requires_oncology_preauth'     =>
+                    $r['requiresOncologyPreauth'] ?? false,
+                'requires_radiology_preauth'    =>
+                    $r['requiresRadiologyPreauth'] ?? false,
+                'requires_optical_preauth'      =>
+                    $r['requiresOpticalPreauth'] ?? false,
+                'applicable_schemes'            =>
+                    $r['applicableSchemes'] ?? [],
+                'applicable_document_types'     =>
+                    $r['applicableDocumentTypes'] ?? [],
+            ])
+            ->values();
+
+        return [
+            'count'         => $data['count'] ?? $interventions->count(),
+            'interventions' => $interventions,
+            'raw'           => $data,
+        ];
+    }
+
+    public function syncPatientShaBenefits(string $patientId): array
+    {
+        return DB::transaction(function () use ($patientId) {
+
+            $subBenefitsResponse = $this->getSubBenefits($patientId);
+
+            $subBenefitsSynced = 0;
+            $interventionsSynced = 0;
+
+            foreach ($subBenefitsResponse['sub_benefits'] as $subBenefitData) {
+
+                if (empty($subBenefitData['code'])) {
+                    continue;
+                }
+
+                $subBenefit = ShaSubBenefit::updateOrCreate(
+                    [
+                        'code' => $subBenefitData['code'],
+                    ],
+                    [
+                        'name'               => $subBenefitData['name'],
+                        'access_point'       => $subBenefitData['access_point'],
+                        'fund'                => $subBenefitData['fund'],
+                        'parent_benefit'      => $subBenefitData['parent_benefit'],
+                        'parent_benefit_code' => $subBenefitData['parent_benefit_code'],
+                        'active'              => true,
+                    ]
+                );
+
+                $subBenefitsSynced++;
+
+                $interventionsResponse = $this->getInterventions(
+                    $patientId,
+                    $subBenefit->code
+                );
+
+                foreach ($interventionsResponse['interventions'] as $interventionData) {
+
+                    if (empty($interventionData['code'])) {
+                        continue;
+                    }
+
+                    ShaIntervention::updateOrCreate(
+                        [
+                            'code' => $interventionData['code'],
+                        ],
+                        [
+                            'sha_sub_benefit_id' =>
+                                $subBenefit->id,
+                            'name' =>
+                                $interventionData['name'],
+                            'access_point' =>
+                                $interventionData['access_point'],
+                            'payment_mechanism' =>
+                                $interventionData['payment_mechanism'],
+                            'overall_tariff' =>
+                                $interventionData['overall_tariff'],
+                            'fund' =>
+                                $interventionData['fund'],
+                            'needs_preauth' =>
+                                $interventionData['needs_preauth'],
+                            'needs_manual_preauth_approval' =>
+                                $interventionData['needs_manual_preauth_approval'],
+                            'needs_doctor_authorization' =>
+                                $interventionData['needs_doctor_authorization'],
+                            'requires_surgical_preauth' =>
+                                $interventionData['requires_surgical_preauth'],
+                            'requires_renal_preauth' =>
+                                $interventionData['requires_renal_preauth'],
+                            'requires_oncology_preauth' =>
+                                $interventionData['requires_oncology_preauth'],
+                            'requires_radiology_preauth' =>
+                                $interventionData['requires_radiology_preauth'],
+                            'requires_optical_preauth' =>
+                                $interventionData['requires_optical_preauth'],
+                            'applicable_schemes' =>
+                                $interventionData['applicable_schemes'],
+                            'applicable_document_types' =>
+                                $interventionData['applicable_document_types'],
+                            'active' => true,
+                            'last_synced_at' => now(),
+                        ]
+                    );
+
+                    $interventionsSynced++;
+                }
+            }
+
+            return [
+                'patient_id'           => $patientId,
+                'sub_benefits_synced'  => $subBenefitsSynced,
+                'interventions_synced' => $interventionsSynced,
+            ];
+        });
+    }
+
+    public function searchPractitioner(
+        string $identificationNumber,
+        string $identificationType = 'registration_number',
+        string $regulator = 'KMPDC'
+    ): array {
+        $token = $this->getAccessToken();
+
+        $url = rtrim($this->baseUrl, '/') .
+            '/api/v1/professionals';
+
+        $query = [
+            'identification_number' => $identificationNumber,
+            'identification_type'   => $identificationType,
+            'regulator'             => $regulator,
+        ];
+
+        $response = Http::withToken($token)
+            ->acceptJson()
+            ->timeout(15)
+            ->get($url, $query);
+
+        $this->logGatewayCall(
+            'searchPractitioner',
+            'GET',
+            $url,
+            $response,
+            ['query' => $query]
+        );
+
+        if ($response->status() === 400) {
+            $message = $response->json('message');
+
+            if (
+                is_string($message) &&
+                str_contains(
+                    strtolower($message),
+                    'no practitioner membership returned'
+                )
+            ) {
+                return [
+                    'found'   => false,
+                    'message' => $message,
+                    'raw'     => $response->json(),
+                ];
+            }
+        }
+
+        if ($response->failed()) {
+            throw new Exception(
+                "Practitioner search failed ({$response->status()}): " .
+                $response->body()
+            );
+        }
+
+        return [
+            'found' => true,
+            'data'  => $response->json(),
+        ];
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | SCENARIO 5 — SHIF OP / FFS / NORMAL / PREAUTH
+    |--------------------------------------------------------------------------
+    */
+
+    /**
+     * Create a preauthorization.
+     *
+     * POST /api/v1/preauths
+     */
+    public function createPreauthorization(array $params): array
+    {
+        foreach ([
+            'consent_token',
+            'intervention_code',
+            'service_start',
+            'service_end',
+        ] as $required) {
+            if (
+                !isset($params[$required]) ||
+                $params[$required] === ''
+            ) {
+                throw new Exception(
+                    "createPreauthorization: missing required param '{$required}'."
+                );
+            }
+        }
+
+        $token = $this->getAccessToken();
+
+        $url = rtrim($this->baseUrl, '/') .
+            '/api/v1/preauths';
+
+        $items = $params['items'] ?? [];
+        $diagnoses = $params['diagnoses'] ?? [];
+        $doctors = $params['doctors'] ?? [];
+        $attachments = $params['attachments'] ?? [];
+
+        $attachmentMetadata = [];
+
+        foreach ($attachments as $index => $attachment) {
+
+            $filePath = $attachment['file_path'] ?? null;
+
+            if ($filePath && !is_file($filePath)) {
+                throw new Exception(
+                    "createPreauthorization: attachment file not found: {$filePath}"
+                );
+            }
+
+            $fileFieldName = $attachment['file_field_name']
+                ?? "attachments_{$index}_file_blob";
+
+            $attachmentMetadata[] = [
+                'document_title'  =>
+                    $attachment['document_title'] ?? null,
+                'document_type'   =>
+                    $attachment['document_type'] ?? null,
+                'file_field_name' =>
+                    $fileFieldName,
+            ];
+        }
+
+        $multipart = [
+            [
+                'name'     => 'consent_token',
+                'contents' => $params['consent_token'],
+            ],
+            [
+                'name'     => 'intervention_code',
+                'contents' => $params['intervention_code'],
+            ],
+            [
+                'name'     => 'service_start',
+                'contents' => $params['service_start'],
+            ],
+            [
+                'name'     => 'service_end',
+                'contents' => $params['service_end'],
+            ],
+            [
+                'name'     => 'items',
+                'contents' => json_encode($items),
+            ],
+            [
+                'name'     => 'diagnoses',
+                'contents' => json_encode($diagnoses),
+            ],
+            [
+                'name'     => 'doctors',
+                'contents' => json_encode($doctors),
+            ],
+            [
+                'name'     => 'attachments',
+                'contents' => json_encode($attachmentMetadata),
+            ],
+            [
+                'name'     => 'provider_notification_email',
+                'contents' =>
+                    $params['provider_notification_email'] ?? '',
+            ],
+        ];
+
+        foreach ($attachments as $index => $attachment) {
+
+            $filePath = $attachment['file_path'] ?? null;
+
+            if (!$filePath) {
+                continue;
+            }
+
+            $fileFieldName = $attachment['file_field_name']
+                ?? "attachments_{$index}_file_blob";
+
+            $multipart[] = [
+                'name'     => $fileFieldName,
+                'contents' => fopen($filePath, 'r'),
+                'filename' => basename($filePath),
+            ];
+        }
+
+        $response = Http::withToken($token)
+            ->acceptJson()
+            ->asMultipart()
+            ->timeout(30)
+            ->post($url, $multipart);
+
+        $this->logGatewayCall(
+            'createPreauthorization',
+            'POST',
+            $url,
+            $response,
+            [
+                'intervention_code' =>
+                    $params['intervention_code'],
+                'items_count' =>
+                    count($items),
+                'diagnoses_count' =>
+                    count($diagnoses),
+                'attachments_count' =>
+                    count($attachments),
+            ]
+        );
+
+        if ($response->failed()) {
+            throw new Exception(
+                "Create preauthorization failed ({$response->status()}): " .
+                $response->body()
+            );
+        }
+
+        $data = $response->json();
+
+        return [
+            'success' => true,
+            'preauthorization_id' =>
+                $data['id']
+                ?? $data['guid']
+                ?? $data['preauthorization_id']
+                ?? null,
+            'status' =>
+                $data['status']
+                ?? $data['workflow_state']
+                ?? null,
+            'raw' => $data,
+        ];
+    }
+
+    /**
+     * Get the current preauthorization status.
+     *
+     * GET /api/v1/preauths?consent_token=...
+     */
+    public function getPreauthorizationStatus(
+        string $consentToken
+    ): array {
+        if (blank($consentToken)) {
+            throw new Exception(
+                'getPreauthorizationStatus: consent token is required.'
+            );
+        }
+
+        $token = $this->getAccessToken();
+
+        $url = rtrim($this->baseUrl, '/') .
+            '/api/v1/preauths';
+
+        $query = [
+            'consent_token' => $consentToken,
+        ];
+
+        $response = Http::withToken($token)
+            ->acceptJson()
+            ->timeout(15)
+            ->get($url, $query);
+
+        $this->logGatewayCall(
+            'getPreauthorizationStatus',
+            'GET',
+            $url,
+            $response,
+            [
+                'query' => [
+                    'consent_token' => '[REDACTED]',
+                ],
+            ]
+        );
+
+        if ($response->failed()) {
+            throw new Exception(
+                "Preauthorization status failed ({$response->status()}): " .
+                $response->body()
+            );
+        }
+
+        $data = $response->json();
+
+        $preauthorization = $data;
+
+        if (
+            isset($data['results']) &&
+            is_array($data['results'])
+        ) {
+            $preauthorization = $data['results'][0] ?? [];
+        } elseif (
+            isset($data['data']) &&
+            is_array($data['data'])
+        ) {
+            $preauthorization = $data['data'];
+        }
+
+        return [
+            'preauthorization_id' =>
+                $preauthorization['id']
+                ?? $preauthorization['guid']
+                ?? $preauthorization['preauthorization_id']
+                ?? null,
+
+            'status' =>
+                $preauthorization['status']
+                ?? $preauthorization['workflow_state']
+                ?? null,
+
+            'raw' => $data,
+        ];
+    }
+
+    /**
+     * Poll until FINALISED or terminal failure.
+     */
+    public function waitForPreauthorization(
+        string $consentToken,
+        int $attempts = 12,
+        int $seconds = 5
+    ): array {
+        if (blank($consentToken)) {
+            throw new Exception(
+                'waitForPreauthorization: consent token is required.'
+            );
+        }
+
+        if ($attempts < 1) {
+            throw new Exception(
+                'waitForPreauthorization: attempts must be at least 1.'
+            );
+        }
+
+        $result = null;
+
+        for ($attempt = 1; $attempt <= $attempts; $attempt++) {
+
+            $result = $this->getPreauthorizationStatus(
+                $consentToken
+            );
+
+            $status = strtoupper(
+                trim((string) ($result['status'] ?? ''))
+            );
+
+            if ($status === 'FINALISED') {
+                return [
+                    'success' => true,
+                    'status'  => 'FINALISED',
+                    'attempt' => $attempt,
+                    'data'    => $result,
+                ];
+            }
+
+            if (in_array($status, [
+                'REJECTED',
+                'DECLINED',
+                'CANCELLED',
+                'FAILED',
+            ], true)) {
+                return [
+                    'success' => false,
+                    'status'  => $status,
+                    'attempt' => $attempt,
+                    'data'    => $result,
+                ];
+            }
+
+            if ($attempt < $attempts) {
+                sleep($seconds);
+            }
+        }
+
+        return [
+            'success' => false,
+            'status'  => 'TIMEOUT',
+            'attempt' => $attempts,
+            'data'    => $result,
+        ];
+    }
+
+    /**
+     * Preview the current virtual claim.
+     *
+     * POST /api/v1/claims/preview
+     */
+    public function previewClaim(string $consentToken): array
+    {
+        if (blank($consentToken)) {
+            throw new Exception(
+                'previewClaim: consent token is required.'
+            );
+        }
+
+        $token = $this->getAccessToken();
+
+        $url = rtrim($this->baseUrl, '/') .
+            '/api/v1/claims/preview';
+
+        $payload = [
+            'consent_token' => $consentToken,
+        ];
+
+        $response = Http::withToken($token)
+            ->acceptJson()
+            ->timeout(20)
+            ->post($url, $payload);
+
+        $this->logGatewayCall(
+            'previewClaim',
+            'POST',
+            $url,
+            $response,
+            [
+                'payload_keys' => [
+                    'consent_token',
+                ],
+            ]
+        );
+
+        if ($response->failed()) {
+            throw new Exception(
+                "Claim preview failed ({$response->status()}): " .
+                $response->body()
+            );
+        }
+
+        return [
+            'success' => true,
+            'raw'     => $response->json(),
+        ];
+    }
+
+    /**
+     * Final claim submission.
+     *
+     * POST /api/v1/claims/submit
+     */
+    public function submitClaim(
+        string $consentToken,
+        ?string $invoiceNumber = null,
+        ?string $reasonForUnknownPatient = null
+    ): array {
+        if (blank($consentToken)) {
+            throw new Exception(
+                'submitClaim: consent token is required.'
+            );
+        }
+
+        $token = $this->getAccessToken();
+
+        $url = rtrim($this->baseUrl, '/') .
+            '/api/v1/claims/submit';
+
+        $payload = [
+            'consent_token' => $consentToken,
+        ];
+
+        if ($invoiceNumber !== null) {
+            $payload['invoice_number'] = $invoiceNumber;
+        }
+
+        if ($reasonForUnknownPatient !== null) {
+            $payload['reason_for_unknown_patient'] =
+                $reasonForUnknownPatient;
+        }
+
+        $response = Http::withToken($token)
+            ->acceptJson()
+            ->timeout(20)
+            ->post($url, $payload);
+
+        $this->logGatewayCall(
+            'submitClaim',
+            'POST',
+            $url,
+            $response,
+            [
+                'payload_keys' => array_keys($payload),
+            ]
+        );
+
+        if ($response->failed()) {
+            throw new Exception(
+                "Submit claim failed ({$response->status()}): " .
+                $response->body()
+            );
+        }
+
+        return [
+            'success' => true,
+            'raw'     => $response->json(),
+        ];
+    }
+}
